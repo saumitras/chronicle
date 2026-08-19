@@ -1,0 +1,277 @@
+networks:
+  chronicle:
+    driver: bridge
+    name: chronicle
+
+volumes:
+  postgres_data:
+  kafka_data:
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16
+    container_name: chronicle-postgres
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-chronicle}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./ops/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: chronicle-kafka
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: chronicle-cluster-001
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  temporal:
+    image: temporalio/auto-setup:1.29.1
+    container_name: chronicle-temporal
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    volumes:
+      - ./ops/dynamicconfig:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    container_name: chronicle-temporal-ui
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+      - TEMPORAL_UI_PUBLIC_PATH=/temporal
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  gateway:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile
+      args:
+        SERVICE: gateway
+    container_name: chronicle-gateway
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8000:8000"
+    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      CHRONICLE_DB_URL: postgresql+asyncpg://chronicle:chronicle@postgres:5432/chronicle
+      PROJECTION_SERVICE_URL: http://projection-service:8004
+      TEMPORAL_HOST: temporal
+      TEMPORAL_PORT: "7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  alert-generator:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile
+      args:
+        SERVICE: alert-generator
+    container_name: chronicle-alert-generator
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8001:8001"
+    command: uvicorn alert_generator.main:app --host 0.0.0.0 --port 8001
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CHRONICLE_DB_URL: postgresql+asyncpg://chronicle:chronicle@postgres:5432/chronicle
+      GATEWAY_URL: http://gateway:8000
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile
+      args:
+        SERVICE: orchestrator
+    container_name: chronicle-orchestrator
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8002:8002"
+    command: uvicorn orchestrator.main:app --host 0.0.0.0 --port 8002
+    env_file: .env
+    environment:
+      CHRONICLE_DB_URL: postgresql+asyncpg://chronicle:chronicle@postgres:5432/chronicle
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TEMPORAL_HOST: temporal
+      TEMPORAL_PORT: "7233"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  agents:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile
+      args:
+        SERVICE: agents
+    container_name: chronicle-agents
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8003:8003"
+    command: uvicorn agents.main:app --host 0.0.0.0 --port 8003
+    env_file: .env
+    environment:
+      CHRONICLE_DB_URL: postgresql+asyncpg://chronicle:chronicle@postgres:5432/chronicle
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TEMPORAL_HOST: temporal
+      TEMPORAL_PORT: "7233"
+      TEMPORAL_TASK_QUEUE: chronicle-agent-tasks
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  projection-service:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile
+      args:
+        SERVICE: projection-service
+    container_name: chronicle-projection-service
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "8004:8004"
+    command: uvicorn projection_service.main:app --host 0.0.0.0 --port 8004
+    env_file: .env
+    environment:
+      CHRONICLE_DB_URL: postgresql+asyncpg://chronicle:chronicle@postgres:5432/chronicle
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      GATEWAY_URL: http://gateway:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── UI ──────────────────────────────────────────────────────────────────────
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: chronicle-ui
+    restart: unless-stopped
+    networks: [chronicle]
+    ports:
+      - "3000:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:80 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
